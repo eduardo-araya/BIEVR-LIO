@@ -2,8 +2,9 @@
   <img width=400 src="doc/bievr_final.svg">
 </p>
 
+<p align="center">
 # BIEVR-LIO: Robust LiDAR-Inertial Odometry through Bump-Image-Enhanced Voxel Maps
-
+</p>
 <p align="center">
 <a href="https://patripfr.github.io/bievr-lio/"><img src="https://shieldcn.dev/badge/Project-Page-gray?size=xs" alt="Project Page" /></a>
 <a href="https://arxiv.org/abs/2604.14421"><img src="https://shieldcn.dev/badge/arXiv-2604.14421-b31b1b?logo=arxiv&size=xs" alt="arXiv" /></a>
@@ -14,8 +15,8 @@
 
 <p align="center">
 <a href="https://github.com/ethz-asl/BIEVR-LIO"><img src="https://shieldcn.dev/badge/-C++-blue?logo=cplusplus&size=xs" /></a>
-<a href="https://github.com/ethz-asl/BIEVR-LIO"><img src="https://shieldcn.dev/badge/ROS-Noetic-blue?size=xs" alt="ROS1" /></a>
-<a href="https://github.com/ethz-asl/BIEVR-LIO"><img src="https://shieldcn.dev/badge/ROS2-Jazzy-blue?size=xs" alt="ROS2" /></a>
+<a href="https://github.com/ethz-asl/BIEVR-LIO/actions/workflows/build_20_04.yaml"><img src="https://img.shields.io/github/actions/workflow/status/ethz-asl/BIEVR-LIO/build_20_04.yaml?branch=feature/CI&style=for-the-badge&logo=github&label=Noetic%20Build" alt="Ubuntu 20.04 + ROS Noetic Build" /></a>
+<a href="https://github.com/ethz-asl/BIEVR-LIO/actions/workflows/build_24_04.yaml"><img src="https://img.shields.io/github/actions/workflow/status/ethz-asl/BIEVR-LIO/build_24_04.yaml?branch=feature/CI&style=for-the-badge&logo=github&label=Jazzy%20Build" alt="Ubuntu 24.04 + ROS Jazzy Build" /></a>
 </p>
 
 <p align="center">
