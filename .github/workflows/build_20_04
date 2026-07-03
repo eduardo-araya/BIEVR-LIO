@@ -53,7 +53,6 @@ jobs:
         chmod +x $GITHUB_WORKSPACE/docker/scripts/install_ceres.sh
         sudo $GITHUB_WORKSPACE/docker/scripts/install_ceres.sh
     - name: Release Build Test
-      working-directory: 
       env:
         DEBIAN_FRONTEND: noninteractive
       shell: bash
