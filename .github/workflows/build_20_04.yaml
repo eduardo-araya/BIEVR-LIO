@@ -50,6 +50,7 @@ jobs:
         sudo apt update
         sudo apt-get install -y --no-install-recommends ros-noetic-desktop-full=1.5.0-1*
         sudo apt-get install -y python3-vcstool python3-catkin-tools libgoogle-glog-dev ros-$ROS_DISTRO-cmake-modules
+        sudo apt-get install -y git build-essential cmake libeigen3-dev
         chmod +x $GITHUB_WORKSPACE/docker/scripts/install_ceres.sh
         sudo $GITHUB_WORKSPACE/docker/scripts/install_ceres.sh
     - name: Release Build Test
