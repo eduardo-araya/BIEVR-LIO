@@ -28,12 +28,9 @@ ENV SCRIPTS_PATH=/home/${USERNAME}/scripts
 # Run the general and ROS dep installation (needs root for apt)
 RUN scripts/install_deps_ros2.sh
 
-# Install Ceres (needs root for make install into /opt)
+# Install Ceres into /usr/local (needs root); it lands on cmake's default
+# search path, so no Ceres_DIR / CMAKE_PREFIX_PATH is required.
 RUN scripts/install_ceres.sh
-
-# Make the custom-prefix Ceres install discoverable to catkin/cmake at build and runtime
-ENV Ceres_DIR=/opt/ceres/install/lib/cmake/Ceres
-ENV CMAKE_PREFIX_PATH=/opt/ceres/install:${CMAKE_PREFIX_PATH}
 
 # Switch to the non-root user to build the workspace into their home.
 # uid=1000 lets the non-root user read the forwarded SSH agent socket for the

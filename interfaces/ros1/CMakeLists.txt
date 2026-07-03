@@ -106,11 +106,3 @@ install(DIRECTORY include/${PROJECT_NAME}/
 install(DIRECTORY launch rviz
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
-catkin_install_python(PROGRAMS
-  scripts/flip_imu_z.py
-  scripts/gazebo_gt_to_path.py
-  scripts/odom_to_path.py
-  scripts/posestamped_to_path.py
-  scripts/tf_to_path.py
-  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
-)
