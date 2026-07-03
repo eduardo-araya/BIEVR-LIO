@@ -50,8 +50,7 @@ export ROS_EDITION=ROS1
 cd $CATKIN_WS/src
 
 # Clone BIEVR-LIO
-git clone git@github.com:patripfr/BIEVR-LIO.git
-#git clone https://github.com/patripfr/BIEVR-LIO.git
+git clone git@github.com:ethz-asl/BIEVR-LIO.git
 cd BIEVR-LIO
 
 # Build it!!

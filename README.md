@@ -13,9 +13,9 @@
 </p>
 
 <p align="center">
-<a href="https://github.com/patripfr/lio"><img src="https://img.shields.io/badge/-C++-blue?logo=cplusplus?style=flat-square" /></a>
-<a href="https://github.com/patripfr/lio"><img src="https://img.shields.io/badge/ROS-Noetic-blue?style=flat-square" alt="ROS1" /></a>
-<a href="https://github.com/patripfr/lio"><img src="https://img.shields.io/badge/ROS2-Jazzy-blue?style=flat-square" alt="ROS2" /></a>
+<a href="https://github.com/ethz-asl/BIEVR-LIO"><img src="https://img.shields.io/badge/-C++-blue?logo=cplusplus?style=flat-square" /></a>
+<a href="https://github.com/ethz-asl/BIEVR-LIO"><img src="https://img.shields.io/badge/ROS-Noetic-blue?style=flat-square" alt="ROS1" /></a>
+<a href="https://github.com/ethz-asl/BIEVR-LIO"><img src="https://img.shields.io/badge/ROS2-Jazzy-blue?style=flat-square" alt="ROS2" /></a>
 </p>
 
 <p align="center">
@@ -91,7 +91,7 @@ catkin config --cmake-args -DCMAKE_BUILD_TYPE=Release
 catkin config --merge-devel
 
 cd ~/catkin_ws/src
-git clone git@github.com:patripfr/lio.git BIEVR-LIO
+git clone git@github.com:ethz-asl/BIEVR-LIO.git BIEVR-LIO
 ```
 
 Install the Ceres version used by BIEVR-LIO with the provided script (builds
@@ -160,7 +160,7 @@ Create a colcon workspace and clone BIEVR-LIO into it:
 ```bash
 mkdir -p ~/colcon_ws/src
 cd ~/colcon_ws/src
-git clone git@github.com:patripfr/lio.git BIEVR-LIO
+git clone git@github.com:ethz-asl/BIEVR-LIO.git BIEVR-LIO
 ```
 
 Install the Ceres version used by BIEVR-LIO with the provided script (builds

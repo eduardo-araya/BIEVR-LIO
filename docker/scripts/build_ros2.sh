@@ -43,8 +43,7 @@ colcon build --cmake-args -DROS_EDITION=ROS2 -DDISTRO_ROS=jazzy --packages-selec
 cd $COLCON_WS/src
 
 # Clone BIEVR-LIO
-git clone git@github.com:patripfr/BIEVR-LIO.git
-#git clone https://github.com/patripfr/BIEVR-LIO.git
+git clone git@github.com:ethz-asl/BIEVR-LIO.git
 
 cd $COLCON_WS
 # Build it!!
