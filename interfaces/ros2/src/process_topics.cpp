@@ -12,8 +12,13 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <string>
 
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+
 #include "bievr_lio/config_loader.h"
+#include "bievr_lio_ros2/output_manager.h"
 #include "bievr_lio_ros2/publisher.h"
+#include "bievr_lio_ros2/self_filter.h"
 #include "bievr_ros_common/conversions.h"
 #ifdef BIEVR_WITH_LIVOX
 #include <livox_ros_driver2/msg/custom_msg.hpp>
@@ -43,6 +48,41 @@ int main(int argc, char** argv) {
   auto pipeline = std::make_shared<bievr::Pipeline>(config.pipeline_config);
   auto synchronizer = std::make_shared<bievr::Synchronizer>(pipeline);
   auto lio_pub = std::make_shared<bievr::Publisher>(node, pipeline, "bievr_lio");
+
+  // TF buffer: needed by the box self-filter and the base-frame output stage.
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener;
+  if (config.self_filter.enable || !config.frames.base_frame.empty()) {
+    tf_buffer = std::make_shared<tf2_ros::Buffer>(
+        node->get_clock(), tf2::durationFromSec(config.frames.tf_buffer_seconds));
+    tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer, node);
+  }
+
+  // Self-filter (virtual boxes anchored to TF frames). Runs on the converted
+  // cloud before it enters the synchronizer/pipeline.
+  std::shared_ptr<bievr::SelfFilter> self_filter;
+  if (config.self_filter.enable) {
+    if (config.frames.sensor_frame.empty()) {
+      LOG(E, "self_filter.enable requires frames.sensor_frame (the TF frame of the raw points).");
+      return -1;
+    }
+    self_filter = std::make_shared<bievr::SelfFilter>(node, tf_buffer, config.self_filter,
+                                                      config.frames.sensor_frame);
+  }
+
+  // Output stage: base-frame re-expression + high-rate IMU-propagated odometry.
+  // Registered after the native Publisher so it takes over Odometry publishing.
+  std::shared_ptr<bievr::OutputManager> output_manager;
+  if (!config.frames.base_frame.empty() || config.output.odom_rate_hz > 0.0) {
+    output_manager = std::make_shared<bievr::OutputManager>(node, tf_buffer, config);
+    output_manager->registerWith(pipeline, lio_pub);
+  }
+
+  // Input filter (Livox tag/intensity), applied during message conversion.
+  const std::array<uint8_t, 256> tag_keep = bievr::makeTagKeepLut(config.input_filter.tag_filter);
+  bievr::CloudFilterOptions cloud_filter;
+  cloud_filter.tag_keep = config.input_filter.tag_filter.enable ? &tag_keep : nullptr;
+  cloud_filter.min_intensity = config.input_filter.min_intensity;
 
   // ROS2 has no ShapeShifter: discover the pointcloud topic's type from the
   // graph, then use a generic (serialized) subscription to handle whichever of
@@ -79,7 +119,8 @@ int main(int argc, char** argv) {
           rclcpp::Serialization<sensor_msgs::msg::PointCloud2>().deserialize_message(
               serialized.get(), &msg);
           bievr::StampedIntensityPointcloud pointcloud;
-          if (bievr::msgToPointcloud(msg, pointcloud)) {
+          if (bievr::msgToPointcloud(msg, pointcloud, cloud_filter)) {
+            if (self_filter) self_filter->apply(pointcloud);
             synchronizer->addPointcloud(pointcloud);
           }
         }
@@ -89,7 +130,8 @@ int main(int argc, char** argv) {
           rclcpp::Serialization<livox_ros_driver2::msg::CustomMsg>().deserialize_message(
               serialized.get(), &msg);
           bievr::StampedIntensityPointcloud pointcloud;
-          if (bievr::msgToPointcloud(msg, pointcloud)) {
+          if (bievr::msgToPointcloud(msg, pointcloud, cloud_filter)) {
+            if (self_filter) self_filter->apply(pointcloud);
             synchronizer->addPointcloud(pointcloud);
           }
         }
@@ -106,6 +148,9 @@ int main(int argc, char** argv) {
           return;
         }
         synchronizer->addImu(imu);
+        // After the synchronizer: a scan completed by this sample corrects the
+        // state before the high-rate propagation publish.
+        if (output_manager) output_manager->onImu(imu);
       });
 
   rclcpp::spin(node);

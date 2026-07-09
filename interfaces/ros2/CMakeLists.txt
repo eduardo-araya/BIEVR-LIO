@@ -25,6 +25,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(rosbag2_cpp REQUIRED)
 find_package(rosbag2_storage REQUIRED)
 find_package(bievr_lio REQUIRED)         # plain-CMake package: provides bievr_lio::bievr_lio
@@ -43,6 +44,7 @@ set(ament_dependencies
   std_msgs
   tf2
   tf2_ros
+  visualization_msgs
   rosbag2_cpp
   rosbag2_storage
 )

@@ -21,6 +21,8 @@
 #include <bievr_lio/pipeline.h>
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
+#include <array>
 #include <filesystem>
 #include <ostream>
 #include <sstream>
@@ -36,9 +38,89 @@ struct TopicConfig {
   std::string bag_path = "";
 };
 
+// Input-side Livox noise rejection, applied during message -> internal-cloud
+// conversion (before range filtering / undistortion). The Livox per-point `tag`
+// byte encodes: bits 0-1 spatial-position noise confidence (0 normal, 1
+// high-confidence noise, 2 medium, 3 low — water/mirror reflections get flagged
+// here), bits 2-3 intensity-based noise confidence, bits 4-5 echo number.
+// Structural no-op on clouds without tag/intensity fields (e.g. simulators).
+struct TagFilterConfig {
+  bool enable = false;
+  std::vector<int> spatial_allowed = {0};
+  std::vector<int> intensity_allowed = {0};
+  std::vector<int> echo_allowed = {0, 1};
+};
+
+struct InputFilterConfig {
+  TagFilterConfig tag_filter;
+  double min_intensity = 0.0;  // drop points with intensity < this; <= 0 disables
+};
+
+// Precomputes the 256-entry keep/drop table for the Livox tag byte from the
+// three allow-lists, so the per-point test is a single array lookup.
+inline std::array<uint8_t, 256> makeTagKeepLut(const TagFilterConfig& config) {
+  auto allowed = [](const std::vector<int>& list, int v) {
+    return std::find(list.begin(), list.end(), v) != list.end();
+  };
+  std::array<uint8_t, 256> keep{};
+  for (int tag = 0; tag < 256; ++tag) {
+    const int spatial = tag & 0x3;
+    const int intensity = (tag >> 2) & 0x3;
+    const int echo = (tag >> 4) & 0x3;
+    keep[tag] = allowed(config.spatial_allowed, spatial) &&
+                allowed(config.intensity_allowed, intensity) && allowed(config.echo_allowed, echo);
+  }
+  return keep;
+}
+
+// One virtual filter box, anchored to a TF frame (e.g. a URDF link). Points of
+// every incoming scan that fall inside any box are removed before the pipeline
+// sees them (self-filtering of the carrier vehicle's own body).
+struct SelfFilterBoxConfig {
+  std::string name;                 // label (stats / markers)
+  std::string frame_id;             // TF frame the box is anchored to
+  V3 size = V3::Zero();             // full extents [m] in the box frame
+  V3 offset_translation = V3::Zero();
+  V3 offset_rpy = V3::Zero();       // box pose in frame_id; R = Rz(y)*Ry(p)*Rx(r)
+};
+
+struct SelfFilterConfig {
+  bool enable = false;
+  bool visualize = false;           // publish RViz markers of the boxes
+  double visualize_rate_hz = 5.0;
+  std::vector<SelfFilterBoxConfig> boxes;
+};
+
+// Output re-expression: when `base_frame` is non-empty, the wrapper publishes
+// odometry/TF for `base_frame` instead of the native IMU body frame, resolving
+// TF(sensor_frame <- base_frame) live per publish. This supports carriers where
+// the sensor is NOT rigidly attached to the base (e.g. sensor on a rotating
+// upper body, base on the chassis, joined by a continuous revolute joint).
+struct FramesConfig {
+  std::string base_frame = "";      // "" = native behavior (odometry in IMU frame)
+  std::string sensor_frame = "";    // TF frame the raw points arrive in (LiDAR link)
+  double tf_buffer_seconds = 2.0;
+  int max_tf_age_ms = 100;          // cached-TF fallback validity window
+};
+
+struct OutputConfig {
+  // When > 0, odometry/TF are ALSO published from the IMU-propagation path,
+  // throttled to this rate using EVENT timestamps (sim/bag safe). 0 = publish
+  // only per processed LiDAR frame (native behavior).
+  double odom_rate_hz = 0.0;
+  // Accumulated map cloud for RViz/debug (BIEVR's map is a bump-image voxel
+  // structure with no native cloud output). 0 = off.
+  double map_cloud_rate_hz = 1.0;
+  double map_cloud_voxel_m = 0.2;
+};
+
 struct Config {
   TopicConfig topic_config;
   Pipeline::Config pipeline_config;
+  InputFilterConfig input_filter;
+  SelfFilterConfig self_filter;
+  FramesConfig frames;
+  OutputConfig output;
   // Upper bound on threads used for TBB parallel regions. 0 = let TBB decide
   // (use all available cores); >0 caps parallelism to that many threads.
   int max_num_threads = 0;
@@ -71,6 +153,31 @@ class MergedYaml {
       const YAML::Node& root = *it;
       if (root[key]) {
         return root[key].as<T>();
+      }
+    }
+    return default_value;
+  }
+
+  // Raw access to a `section.key` node (e.g. a list) — the whole node comes from
+  // the last file that defines it (no per-element merging). Invalid node if none.
+  YAML::Node getRaw(const std::string& section, const std::string& key) const {
+    for (auto it = nodes_.rbegin(); it != nodes_.rend(); ++it) {
+      const YAML::Node& root = *it;
+      if (root[section] && root[section][key]) {
+        return root[section][key];
+      }
+    }
+    return YAML::Node(YAML::NodeType::Undefined);
+  }
+
+  // Nested lookup: section.sub.key (used for blocks like frames.tf.*).
+  template <typename T>
+  T getNested(const std::string& section, const std::string& sub, const std::string& key,
+              const T& default_value) const {
+    for (auto it = nodes_.rbegin(); it != nodes_.rend(); ++it) {
+      const YAML::Node& root = *it;
+      if (root[section] && root[section][sub] && root[section][sub][key]) {
+        return root[section][sub][key].as<T>();
       }
     }
     return default_value;
@@ -180,6 +287,19 @@ inline void printConfigOverview(const Config& config) {
   os << "  log_path:             " << (hc.log_path.empty() ? "<none>" : hc.log_path) << "\n";
   os << "calibration (LiDAR -> IMU):\n";
   printExtrinsic(os, "T_I_L", hc.T_I_L);
+  os << "input_filter:\n";
+  os << "  tag_filter:           " << yn(config.input_filter.tag_filter.enable) << "\n";
+  os << "  min_intensity:        " << config.input_filter.min_intensity << "\n";
+  os << "self_filter:            " << yn(config.self_filter.enable) << " ("
+     << config.self_filter.boxes.size() << " boxes)\n";
+  os << "frames:\n";
+  os << "  base_frame:           "
+     << (config.frames.base_frame.empty() ? "<native body frame>" : config.frames.base_frame)
+     << "\n";
+  os << "  sensor_frame:         "
+     << (config.frames.sensor_frame.empty() ? "<none>" : config.frames.sensor_frame) << "\n";
+  os << "output:\n";
+  os << "  odom_rate_hz:         " << config.output.odom_rate_hz << "\n";
   os << "==================================================";
   LOG(I, os.str());
 }
@@ -288,6 +408,69 @@ inline bool loadConfigFromYaml(const std::vector<std::string>& yaml_paths, Confi
       if (!hc.dashboard_ascii_path.empty()) break;
     }
   }
+
+  // --- lidar_input_filter (Livox tag + intensity noise rejection) ---
+  auto& fc = config.input_filter;
+  fc.tag_filter.enable = yaml.getNested<bool>("lidar_input_filter", "tag_filter", "enable", false);
+  fc.tag_filter.spatial_allowed = yaml.getNested<std::vector<int>>(
+      "lidar_input_filter", "tag_filter", "spatial_allowed", fc.tag_filter.spatial_allowed);
+  fc.tag_filter.intensity_allowed = yaml.getNested<std::vector<int>>(
+      "lidar_input_filter", "tag_filter", "intensity_allowed", fc.tag_filter.intensity_allowed);
+  fc.tag_filter.echo_allowed = yaml.getNested<std::vector<int>>(
+      "lidar_input_filter", "tag_filter", "echo_allowed", fc.tag_filter.echo_allowed);
+  fc.min_intensity = yaml.get<double>("lidar_input_filter", "min_intensity", 0.0);
+
+  // --- self_filter (virtual boxes anchored to TF frames) ---
+  auto& sf = config.self_filter;
+  sf.enable = yaml.get<bool>("self_filter", "enable", false);
+  sf.visualize = yaml.get<bool>("self_filter", "visualize", false);
+  sf.visualize_rate_hz = yaml.get<double>("self_filter", "visualize_rate_hz", 5.0);
+  if (const YAML::Node boxes = yaml.getRaw("self_filter", "boxes"); boxes.IsSequence()) {
+    for (const YAML::Node& b : boxes) {
+      SelfFilterBoxConfig box;
+      box.name = b["name"] ? b["name"].as<std::string>() : "";
+      box.frame_id = b["frame_id"] ? b["frame_id"].as<std::string>() : "";
+      const auto size = b["size"] ? b["size"].as<std::vector<double>>() : std::vector<double>{};
+      if (box.frame_id.empty() || size.size() != 3) {
+        LOG(E, "Config error: self_filter box '" << box.name
+                                                 << "' needs a frame_id and a 3-element size.");
+        return false;
+      }
+      box.size = V3(size[0], size[1], size[2]);
+      if (const YAML::Node off = b["offset"]) {
+        if (const YAML::Node t = off["translation"]) {
+          const auto v = t.as<std::vector<double>>();
+          if (v.size() == 3) box.offset_translation = V3(v[0], v[1], v[2]);
+        }
+        if (const YAML::Node r = off["rotation_rpy"]) {
+          const auto v = r.as<std::vector<double>>();
+          if (v.size() == 3) box.offset_rpy = V3(v[0], v[1], v[2]);
+        }
+      }
+      sf.boxes.push_back(box);
+    }
+  }
+  if (sf.enable && sf.boxes.empty()) {
+    LOG(W, "self_filter.enable is true but no boxes are configured; disabling.");
+    sf.enable = false;
+  }
+
+  // --- frames (non-rigid base-frame output re-expression) ---
+  auto& fr = config.frames;
+  fr.base_frame = yaml.get<std::string>("frames", "base_frame", "");
+  fr.sensor_frame = yaml.get<std::string>("frames", "sensor_frame", "");
+  fr.tf_buffer_seconds = yaml.getNested<double>("frames", "tf", "buffer_seconds", 2.0);
+  fr.max_tf_age_ms = yaml.getNested<int>("frames", "tf", "max_tf_age_ms", 100);
+  if (!fr.base_frame.empty() && fr.sensor_frame.empty()) {
+    LOG(E, "Config error: frames.base_frame requires frames.sensor_frame (the TF frame the raw "
+           "points arrive in).");
+    return false;
+  }
+
+  // --- output (high-rate IMU-propagated odometry + debug map cloud) ---
+  config.output.odom_rate_hz = yaml.get<double>("output", "odom_rate_hz", 0.0);
+  config.output.map_cloud_rate_hz = yaml.get<double>("output", "map_cloud_rate_hz", 1.0);
+  config.output.map_cloud_voxel_m = yaml.get<double>("output", "map_cloud_voxel_m", 0.2);
 
   // Lower the log level so DEBUG messages are shown when requested, otherwise
   // keep the default (INFO and above).

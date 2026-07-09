@@ -23,6 +23,8 @@
 #include <tbb/parallel_for.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -76,6 +78,18 @@
 #endif
 
 namespace bievr {
+
+// Input-side per-point noise rejection applied during conversion (the Livox
+// `tag` byte is not carried into the internal cloud layout, so this is the only
+// place it can be evaluated). Dropped points get their xyz zeroed — a range-0
+// point — so the pipeline's min-range filter removes them; the time/intensity
+// rows are left untouched so scan-stamp bookkeeping is unaffected. Structural
+// no-op on clouds without the corresponding fields.
+struct CloudFilterOptions {
+  const std::array<uint8_t, 256>* tag_keep = nullptr;  // nullptr = tag filter off
+  double min_intensity = 0.0;                          // <= 0 disables
+};
+
 namespace conv_detail {
 
 // Above this value a "timestamp" field is interpreted as nanoseconds, below it
@@ -130,7 +144,8 @@ inline T readAt(const uint8_t* p) {
 enum class TimeEncoding {
   kNanosUint32,   // "t": uint32 nanoseconds, relative to scan start (Ouster)
   kSecondsFloat,  // "time": float32 seconds, relative to an arbitrary origin (Velodyne)
-  kStampDouble,   // "timestamp": float64 absolute seconds (or ns above a threshold) (Hesai)
+  kStampDouble,   // "timestamp": float64 absolute seconds (or ns above a threshold) (Hesai/Livox)
+  kNone,          // no time field (e.g. simulator clouds): time = 0, undistortion is identity
 };
 
 template <typename FieldT>
@@ -167,8 +182,8 @@ inline double stampToS(const StampT& stamp) {
 // `timer_name` is the timing label. Called from the wrappers' Livox overloads.
 template <typename LivoxMsgT>
 bool livoxToStampedIntensity(const LivoxMsgT& pointcloud_msg, uint64_t base_stamp_ns,
-                             const char* timer_name,
-                             StampedIntensityPointcloud& stamped_pointcloud) {
+                             const char* timer_name, StampedIntensityPointcloud& stamped_pointcloud,
+                             const CloudFilterOptions& filter = {}) {
   timing::Timer conversion_timer(timer_name);
 
   stamped_pointcloud.stamp = base_stamp_ns;
@@ -188,13 +203,21 @@ bool livoxToStampedIntensity(const LivoxMsgT& pointcloud_msg, uint64_t base_stam
   size_t counter = 0;
   constexpr double kToSeconds = 1e-9;  // offset_time is in nanoseconds
 
+  const bool apply_tag = filter.tag_keep != nullptr;
+  const bool apply_intensity = filter.min_intensity > 0.0;
   for (const auto& pt : pointcloud_msg.points) {
     const double time = static_cast<double>(pt.offset_time) * kToSeconds;  // seconds
+    const double reflectivity = static_cast<double>(pt.reflectivity);
+    // Input filter (tag byte / reflectivity): zero xyz so the min-range filter
+    // removes the point; keep the time so scan-stamp bookkeeping holds.
+    const bool drop = (apply_tag && !(*filter.tag_keep)[pt.tag]) ||
+                      (apply_intensity && reflectivity < filter.min_intensity);
     if (time > 0.2) {
       stamped_pointcloud.data().col(counter) << 0, 0, 0, 0, 0;
+    } else if (drop) {
+      stamped_pointcloud.data().col(counter) << 0, 0, 0, time, reflectivity;
     } else {
-      stamped_pointcloud.data().col(counter) << pt.x, pt.y, pt.z, time,
-          static_cast<double>(pt.reflectivity);
+      stamped_pointcloud.data().col(counter) << pt.x, pt.y, pt.z, time, reflectivity;
     }
     ++counter;
   }
@@ -232,7 +255,8 @@ bool livoxToStampedIntensity(const LivoxMsgT& pointcloud_msg, uint64_t base_stam
 template <typename PointCloud2T>
   requires conv_detail::PointCloud2Like<PointCloud2T>
 bool msgToPointcloud(const PointCloud2T& pointcloud_msg,
-                     StampedIntensityPointcloud& stamped_pointcloud) {
+                     StampedIntensityPointcloud& stamped_pointcloud,
+                     const CloudFilterOptions& filter = {}) {
   using namespace conv_detail;
   timing::Timer conversion_timer("00_conversion_pc2");
 
@@ -275,8 +299,14 @@ bool msgToPointcloud(const PointCloud2T& pointcloud_msg,
     enc = TimeEncoding::kStampDouble;
     off_t = f->offset;
   } else {
-    LOG(E, "Pointcloud has no recognized time field (t/time/timestamp); skipping.");
-    return false;
+    // Simulator clouds (e.g. Gazebo gpu_lidar) carry no per-point time. Treat the
+    // scan as instantaneous (time = 0 -> undistortion is the identity) instead of
+    // dropping it, so the same binary runs on sim data.
+    LOG_FIRST(W, 1,
+              "Pointcloud has no recognized time field (t/time/timestamp); treating scans as "
+              "instantaneous (no undistortion).");
+    enc = TimeEncoding::kNone;
+    off_t = 0;
   }
 
   // Optional float32 intensity channel.
@@ -287,6 +317,14 @@ bool msgToPointcloud(const PointCloud2T& pointcloud_msg,
     LOG_FIRST(W, 1, "Pointcloud has no float32 'intensity' field; intensity set to zero.");
   }
 
+  // Optional uint8 Livox `tag` channel (input filter). The tag filter is a
+  // structural no-op when the field is missing (sim clouds).
+  const PointFieldT* tag_field = findField(fields, "tag");
+  const bool has_tag = tag_field != nullptr && tag_field->datatype == PointFieldT::UINT8;
+  const uint32_t off_tag = has_tag ? tag_field->offset : 0;
+  const bool apply_tag = filter.tag_keep != nullptr && has_tag;
+  const bool apply_intensity = filter.min_intensity > 0.0 && has_intensity;
+
   stamped_pointcloud.resize(num_points);
   auto& data = stamped_pointcloud.data();
   const uint8_t* base = pointcloud_msg.data.data();
@@ -295,8 +333,10 @@ bool msgToPointcloud(const PointCloud2T& pointcloud_msg,
 
   // Fill xyz, time and intensity in a single parallel pass. Each point writes its
   // own (contiguous, column-major) column, so the writes are disjoint.
+  std::atomic<size_t> n_filtered{0};
   tbb::parallel_for(
       tbb::blocked_range<size_t>(0, num_points), [&](const tbb::blocked_range<size_t>& r) {
+        size_t filtered_local = 0;
         for (size_t i = r.begin(); i != r.end(); ++i) {
           const uint8_t* p = base + i * step;
           auto col = data.col(i);
@@ -316,6 +356,9 @@ bool msgToPointcloud(const PointCloud2T& pointcloud_msg,
               time = (raw > kTimestampNsThreshold ? raw * 1e-9 : raw) - stamp_s;
               break;
             }
+            case TimeEncoding::kNone:
+              time = 0.0;
+              break;
           }
 
           if (valid) {
@@ -327,8 +370,31 @@ bool msgToPointcloud(const PointCloud2T& pointcloud_msg,
             col(0) = col(1) = col(2) = col(3) = 0.0;
           }
           col(4) = has_intensity ? static_cast<double>(readAt<float>(p + off_i)) : 0.0;
+
+          // Input filter: zero xyz (range-0 point, removed by the min-range
+          // filter) but keep time/intensity so scan-stamp bookkeeping holds.
+          if (valid && ((apply_tag && !(*filter.tag_keep)[readAt<uint8_t>(p + off_tag)]) ||
+                        (apply_intensity && col(4) < filter.min_intensity))) {
+            col(0) = col(1) = col(2) = 0.0;
+            ++filtered_local;
+          }
         }
+        n_filtered.fetch_add(filtered_local, std::memory_order_relaxed);
       });
+
+  // Cumulative drop statistics, so a too-aggressive filter is visible in the log.
+  if (apply_tag || apply_intensity) {
+    static std::atomic<uint64_t> total_points{0}, total_dropped{0}, n_clouds{0};
+    total_points += num_points;
+    total_dropped += n_filtered.load();
+    const uint64_t clouds = ++n_clouds;
+    if (clouds % 200 == 1) {
+      LOG(I, "[InputFilter] dropped " << total_dropped << "/" << total_points << " points ("
+                                      << (100.0 * static_cast<double>(total_dropped) /
+                                          static_cast<double>(std::max<uint64_t>(total_points, 1)))
+                                      << "%) over " << clouds << " clouds.");
+    }
+  }
 
   // A relative "time" field is offset from an arbitrary origin; shift so the first
   // point sits at t = 0 (matching the original behaviour).
@@ -405,6 +471,14 @@ bool msgToImuMeasurement(const ImuMsgT& imu_msg, ImuMeasurement& imu) {
   imu.acc << imu_msg.linear_acceleration.x, imu_msg.linear_acceleration.y,
       imu_msg.linear_acceleration.z;
   imu.gyro << imu_msg.angular_velocity.x, imu_msg.angular_velocity.y, imu_msg.angular_velocity.z;
+
+  // Simulators (Gazebo around spawn) occasionally emit NaN samples. One NaN
+  // poisons the running bias/gravity means and, through them, every state the
+  // pipeline ever produces — drop the sample instead.
+  if (!imu.acc.allFinite() || !imu.gyro.allFinite()) {
+    LOG_TIMED(W, 5.0, "Skipping IMU measurement with non-finite values.");
+    return false;
+  }
 
   return true;
 }
@@ -543,24 +617,27 @@ void vecToMsg(const V3& vec, Vec3MsgT& msg) {
 #ifdef BIEVR_ROS_COMMON_ROS2
 #ifdef BIEVR_WITH_LIVOX  // ROS2 has only the gen2 driver (livox_ros_driver2)
 inline bool msgToPointcloud(const livox_ros_driver2::msg::CustomMsg& pointcloud_msg,
-                            StampedIntensityPointcloud& stamped_pointcloud) {
+                            StampedIntensityPointcloud& stamped_pointcloud,
+                            const CloudFilterOptions& filter = {}) {
   return conv_detail::livoxToStampedIntensity(pointcloud_msg, pointcloud_msg.timebase,
-                                              "00_conversion_livox2", stamped_pointcloud);
+                                              "00_conversion_livox2", stamped_pointcloud, filter);
 }
 #endif
 #else                    // BIEVR_ROS_COMMON_ROS1
 #ifdef BIEVR_WITH_LIVOX  // gen1: base stamp in the message header
 inline bool msgToPointcloud(const livox_ros_driver::CustomMsg& pointcloud_msg,
-                            StampedIntensityPointcloud& stamped_pointcloud) {
+                            StampedIntensityPointcloud& stamped_pointcloud,
+                            const CloudFilterOptions& filter = {}) {
   return conv_detail::livoxToStampedIntensity(pointcloud_msg, pointcloud_msg.header.stamp.toNSec(),
-                                              "00_conversion_livox", stamped_pointcloud);
+                                              "00_conversion_livox", stamped_pointcloud, filter);
 }
 #endif
 #ifdef BIEVR_WITH_LIVOX2  // gen2: base stamp in `timebase`
 inline bool msgToPointcloud(const livox_ros_driver2::CustomMsg& pointcloud_msg,
-                            StampedIntensityPointcloud& stamped_pointcloud) {
+                            StampedIntensityPointcloud& stamped_pointcloud,
+                            const CloudFilterOptions& filter = {}) {
   return conv_detail::livoxToStampedIntensity(pointcloud_msg, pointcloud_msg.timebase,
-                                              "00_conversion_livox2", stamped_pointcloud);
+                                              "00_conversion_livox2", stamped_pointcloud, filter);
 }
 #endif
 #endif
